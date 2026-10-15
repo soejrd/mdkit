@@ -1,4 +1,4 @@
-# md-kit
+# mdkit
 Portable C drum synthesis voices based on the Elektron Machinedrum.
 
 mdkit is being developed as a collection of individual synthesis voices for
