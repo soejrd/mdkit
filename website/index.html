@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafafa">
+  <title>mdkit drum machines</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell"><main>
+    <h1 class="sr-only">mdkit drum machines</h1>
+    <section class="instrument" aria-label="Machine sequencer">
+      <div class="screw top-left"></div><div class="screw top-right"></div>
+      <div class="screw bottom-left"></div><div class="screw bottom-right"></div>
+      <div class="main-panel">
+        <div class="sample-section">
+          <div class="display">
+            <div class="display-top"><span id="machine-number">MDKIT / DRUM MACHINES</span><span>44.1 kHz</span></div>
+            <div id="machine-title" class="sample-title">Ready to play</div>
+            <svg class="waveform" viewBox="0 0 460 104" preserveAspectRatio="none" role="img" aria-label="Live audio oscilloscope">
+              <path d="M0 26H460M0 52H460M0 78H460M46 0V104M92 0V104M138 0V104M184 0V104M230 0V104M276 0V104M322 0V104M368 0V104M414 0V104" stroke="currentColor" stroke-width=".5" opacity=".15"/>
+              <path id="scope" d="M0 52H460" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+            </svg>
+          </div>
+          <div class="sample-actions">
+            <div id="machine-picker" class="sample-picker">
+              <button id="machine" class="sample-select" type="button" aria-label="Select machine" aria-haspopup="menu" aria-expanded="false" aria-controls="machine-menu" disabled><span id="machine-choice">Loading instruments…</span><svg class="chevron-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+              <div id="machine-menu" class="machine-menu" role="menu" aria-label="Select machine" hidden>
+                <div id="machine-families" role="group" aria-label="Families"></div>
+                <div id="machine-voices" role="menu" aria-label="Voices"></div>
+              </div>
+            </div>
+            <button id="trigger" class="audition-button" type="button">▶ Play sound</button>
+            <button id="download" class="audition-button" type="button" disabled><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/></svg>Download sample</button>
+          </div>
+        </div>
+        <div class="controls-section"><div id="controls" class="knob-grid" aria-label="Machine parameters"><p class="control-placeholder">Loading controls…</p></div></div>
+      </div>
+      <div class="transport-bar">
+        <div class="transport">
+          <button id="play" class="play-button" type="button" aria-pressed="false"><span aria-hidden="true">▶</span><span id="play-label">Play</span></button>
+          <button id="stop" class="stop-button" type="button" aria-label="Stop">■</button>
+          <label class="tempo"><input id="tempo" type="number" min="30" max="240" value="120" aria-label="Tempo"><span>BPM</span><span class="tempo-arrows"><button id="tempo-up" type="button" aria-label="Increase BPM"><svg class="chevron-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button><button id="tempo-down" type="button" aria-label="Decrease BPM"><svg class="chevron-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button></span></label>
+        </div>
+
+        <span class="player-credit">made by <a href="https://github.com/soejrd/mdkit" target="_blank" rel="noopener noreferrer">soejrd</a></span>
+        <button id="theme" class="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Dark mode"><span class="theme-toggle-thumb">☾</span></button>
+      </div>
+      <div class="sequencer-section">
+        <div class="sequencer-heading"><div class="section-label">STEP SEQUENCER</div><div class="sequence-tools"><button id="clear" type="button">Clear</button></div></div>
+        <div id="steps" class="steps"></div>
+      </div>
+      <p id="status" role="status">Loading instruments… Drag knobs to edit; Space plays or stops the pattern.</p>
+    </section>
+    <div class="under-instrument"><span class="player-credit">made by <a href="https://github.com/soejrd/mdkit" target="_blank" rel="noopener noreferrer">soejrd</a></span></div>
+  </main></div>
+  <script src="script.js"></script>
+</body>
+</html>

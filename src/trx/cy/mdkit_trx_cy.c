@@ -1,0 +1,512 @@
+/* SPDX-License-Identifier: CC0-1.0
+ * TRX-CY standalone synthesis voice.
+ */
+#include "mdkit_trx_cy.h"
+
+/* ---- Default controls --------------------------------------------------- */
+/* Active controls are in descriptor order; unused clock slots stay at 64. */
+static const unsigned char mdkit_trx_cy_defaults[MDKIT_MAX_CONTROLS] = {
+    127, 0, 0, 127, 0, 127, 64, 64
+};
+#define trx_cy_MD_MASK24 UINT32_C(0xffffff)
+#define trx_cy_MD_MASK48 UINT64_C(0xffffffffffff)
+#define trx_cy_MD_MASK56 UINT64_C(0xffffffffffffff)
+#define trx_cy_MD_VOICE_BLOCK 32u
+enum { trx_cy_MD_TRX_PUBLISH=1,trx_cy_MD_TRX_TRIGGER=2,trx_cy_MD_TRX_FIRST=4 };
+static inline int64_t trx_cy_md_signed_bits(uint64_t word, unsigned bits)
+{
+    const uint64_t sign = UINT64_C(1) << (bits - 1);
+    const uint64_t mask = (UINT64_C(1) << bits) - 1;
+    word &= mask;
+    return (word & sign) ? (int64_t)word - (int64_t)(UINT64_C(1) << bits)
+                         : (int64_t)word;
+}
+static inline int64_t trx_cy_md_s24(uint32_t w) { return trx_cy_md_signed_bits(w & trx_cy_MD_MASK24, 24); }
+static inline int64_t trx_cy_md_s56(uint64_t a) { return trx_cy_md_signed_bits(a & trx_cy_MD_MASK56, 56); }
+static inline uint32_t trx_cy_md_mid(uint64_t a) { return (uint32_t)((a >> 24) & trx_cy_MD_MASK24); }
+static inline uint64_t trx_cy_md_from24(uint32_t w)
+{ return ((uint64_t)(trx_cy_md_s24(w) * (INT64_C(1) << 24))) & trx_cy_MD_MASK56; }
+static inline uint64_t trx_cy_md_add(uint64_t a, uint64_t b) { return (a + b) & trx_cy_MD_MASK56; }
+static inline uint64_t trx_cy_md_sub(uint64_t a, uint64_t b) { return (a - b) & trx_cy_MD_MASK56; }
+static inline uint64_t trx_cy_md_asl(uint64_t a, unsigned n) { return (a << n) & trx_cy_MD_MASK56; }
+static inline uint64_t trx_cy_md_asr(uint64_t a, unsigned n)
+{
+    const int64_t v = trx_cy_md_s56(a);
+    const int64_t sh = v >= 0 ? v / (INT64_C(1) << n)
+        : -((-v + (INT64_C(1) << n) - 1) / (INT64_C(1) << n));
+    return (uint64_t)sh & trx_cy_MD_MASK56;
+}
+static inline uint64_t trx_cy_md_mpy(uint32_t a, uint32_t b)
+{ return (uint64_t)(trx_cy_md_s24(a) * trx_cy_md_s24(b) * 2) & trx_cy_MD_MASK56; }
+static inline uint64_t trx_cy_md_mac(uint64_t acc, uint32_t x, uint32_t y)
+{
+    return (acc + trx_cy_md_mpy(x, y)) & trx_cy_MD_MASK56;
+}
+static inline uint32_t trx_cy_md_acc_to_word(uint64_t a)
+{
+    const int64_t v = trx_cy_md_s56(a);
+    if(v < -(INT64_C(0x800000) << 24)) return UINT32_C(0x800000);
+    if(v >  (INT64_C(0x7fffff) << 24)) return UINT32_C(0x7fffff);
+    return trx_cy_md_mid(a);
+}
+static inline void trx_cy_md_control_clock_seed(mdkit_control_clock *c, unsigned count,
+                                         const unsigned char *knobs)
+{
+    c->count = count;
+    for (unsigned i = 0; i < count; ++i) {
+        const float v = (float)knobs[i];
+        c->target[i] = c->raw[i] = c->current[i] = c->pending[i] = v;
+    }
+    c->block = 0; c->next_update = 0; c->publish_block = 0; c->pending_valid = 0;
+}
+static inline void trx_cy_md_trx_events_init(mdkit_control_clock *c,mdkit_trx_cy_events *e)
+{
+
+    trx_cy_md_control_clock_seed(c,8,mdkit_trx_cy_defaults); c->next_update=2;
+    e->targets=e->trigger=e->triggered=0;
+    for(unsigned i=0;i<8;++i){e->queued[i]=mdkit_trx_cy_defaults[i];e->last_raw[i]=(unsigned)mdkit_trx_cy_defaults[i] * 128u;}
+}
+static inline void trx_cy_md_trx_events_target(mdkit_trx_cy_events *e,unsigned count,unsigned i,unsigned value)
+{ if(i<count){e->queued[i]=value>127?127:value;e->targets|=1u<<i;} }
+static inline unsigned trx_cy_md_trx_events_boundary(mdkit_control_clock *c,mdkit_trx_cy_events *e,int trigger_only)
+{
+    unsigned result=0;
+    if(c->pending_valid && c->block>=c->publish_block){
+        for(unsigned i=0;i<8;++i)c->current[i]=c->pending[i];
+        c->pending_valid=0;result=trx_cy_MD_TRX_PUBLISH;
+    }
+    if(c->block==c->next_update){
+        int changed=0;
+        for(unsigned i=0;i<8;++i){
+            uint32_t raw=(uint32_t)(128.0f*c->raw[i]);
+            c->pending[i]=c->raw[i];changed|=raw!=e->last_raw[i];e->last_raw[i]=raw;
+            c->raw[i]=(float)((3*raw+128*(uint32_t)c->target[i])/4)/128.0f;
+        }
+        c->pending_valid=changed&&!trigger_only;c->publish_block=c->block+1;c->next_update+=12;
+    }
+    for(unsigned i=0;i<8;++i)if(e->targets&(1u<<i))c->target[i]=(float)e->queued[i];
+    e->targets=0;
+    if(e->trigger){
+        for(unsigned i=0;i<8;++i)c->current[i]=c->raw[i];
+        result=trx_cy_MD_TRX_PUBLISH|trx_cy_MD_TRX_TRIGGER|(e->triggered?0:trx_cy_MD_TRX_FIRST);
+        e->trigger=0;e->triggered=1;
+    }
+    ++c->block;return result;
+}
+static const uint32_t trx_cy_control_word_0[128]={
+ 0x7f67fdu,0x7f68fdu,0x7f69fdu,0x7f6afdu,0x7f6bfdu,0x7f6cfdu,0x7f6dfdu,0x7f6efdu,
+ 0x7f6ffdu,0x7f70fdu,0x7f71fdu,0x7f72fdu,0x7f73fdu,0x7f74fdu,0x7f75fdu,0x7f76fdu,
+ 0x7f77fdu,0x7f78fdu,0x7f79fdu,0x7f7afdu,0x7f7bfdu,0x7f7cfdu,0x7f7dfdu,0x7f7efdu,
+ 0x7f7ffdu,0x7f80fdu,0x7f81fdu,0x7f82fdu,0x7f83fdu,0x7f84fdu,0x7f85fdu,0x7f86fdu,
+ 0x7f87fdu,0x7f88fdu,0x7f89fdu,0x7f8afdu,0x7f8bfdu,0x7f8cfdu,0x7f8dfdu,0x7f8efdu,
+ 0x7f8ffdu,0x7f90fdu,0x7f91fdu,0x7f92fdu,0x7f93fdu,0x7f94fdu,0x7f95fdu,0x7f96fdu,
+ 0x7f97fdu,0x7f98fdu,0x7f99fdu,0x7f9afdu,0x7f9bfdu,0x7f9cfdu,0x7f9dfdu,0x7f9efdu,
+ 0x7f9ffdu,0x7fa0fdu,0x7fa1fdu,0x7fa2fdu,0x7fa3fdu,0x7fa4fdu,0x7fa5fdu,0x7fa6fdu,
+ 0x7fa7fdu,0x7fa8fdu,0x7fa9fdu,0x7faafdu,0x7fabfdu,0x7facfdu,0x7fadfdu,0x7faefdu,
+ 0x7faffdu,0x7fb0fdu,0x7fb1fdu,0x7fb2fdu,0x7fb3fdu,0x7fb4fdu,0x7fb5fdu,0x7fb6fdu,
+ 0x7fb7fdu,0x7fb8fdu,0x7fb9fdu,0x7fbafdu,0x7fbbfdu,0x7fbcfdu,0x7fbdfdu,0x7fbefdu,
+ 0x7fbffdu,0x7fc0fdu,0x7fc1fdu,0x7fc2fdu,0x7fc3fdu,0x7fc4fdu,0x7fc5fdu,0x7fc6fdu,
+ 0x7fc7fdu,0x7fc8fdu,0x7fc9fdu,0x7fcafdu,0x7fcbfdu,0x7fccfdu,0x7fcdfdu,0x7fcefdu,
+ 0x7fcffdu,0x7fd0fdu,0x7fd1fdu,0x7fd2fdu,0x7fd3fdu,0x7fd4fdu,0x7fd5fdu,0x7fd6fdu,
+ 0x7fd7fdu,0x7fd8fdu,0x7fd9fdu,0x7fdafdu,0x7fdbfdu,0x7fdcfdu,0x7fddfdu,0x7fdefdu,
+ 0x7fdffdu,0x7fe0fdu,0x7fe1fdu,0x7fe2fdu,0x7fe3fdu,0x7fe4fdu,0x7fe5fdu,0x7fe6fdu,
+};
+static const uint32_t trx_cy_control_word_1[128]={
+ 0x063fbcu,0x065f7cu,0x067ebcu,0x069d7cu,0x06bbbcu,0x06d97cu,0x06f6bcu,0x07137cu,
+ 0x072fbcu,0x074b7cu,0x0766bcu,0x07817cu,0x079bbcu,0x07b57cu,0x07cebcu,0x07e77cu,
+ 0x07ffbcu,0x08177cu,0x082ebcu,0x08457cu,0x085bbcu,0x08717cu,0x0886bcu,0x089b7cu,
+ 0x08afbcu,0x08c37cu,0x08d6bcu,0x08e97cu,0x08fbbcu,0x090d7cu,0x091ebcu,0x092f7cu,
+ 0x093fbcu,0x094f7cu,0x095ebcu,0x096d7cu,0x097bbcu,0x09897cu,0x0996bcu,0x09a37cu,
+ 0x09afbcu,0x09bb7cu,0x09c6bcu,0x09d17cu,0x09dbbcu,0x09e57cu,0x09eebcu,0x09f77cu,
+ 0x09ffbcu,0x0a077cu,0x0a0ebcu,0x0a157cu,0x0a1bbcu,0x0a217cu,0x0a26bcu,0x0a2b7cu,
+ 0x0a2fbcu,0x0a337cu,0x0a36bcu,0x0a397cu,0x0a3bbcu,0x0a3d7cu,0x0a3ebcu,0x0a3f7cu,
+ 0x0a3fbcu,0x0a1ffcu,0x0a00bcu,0x09e1fcu,0x09c3bcu,0x09a5fcu,0x0988bcu,0x096bfcu,
+ 0x094fbcu,0x0933fcu,0x0918bcu,0x08fdfcu,0x08e3bcu,0x08c9fcu,0x08b0bcu,0x0897fcu,
+ 0x087fbcu,0x0867fcu,0x0850bcu,0x0839fcu,0x0823bcu,0x080dfcu,0x07f8bcu,0x07e3fcu,
+ 0x07cfbcu,0x07bbfcu,0x07a8bcu,0x0795fcu,0x0783bcu,0x0771fcu,0x0760bcu,0x074ffcu,
+ 0x073fbcu,0x072ffcu,0x0720bcu,0x0711fcu,0x0703bcu,0x06f5fcu,0x06e8bcu,0x06dbfcu,
+ 0x06cfbcu,0x06c3fcu,0x06b8bcu,0x06adfcu,0x06a3bcu,0x0699fcu,0x0690bcu,0x0687fcu,
+ 0x067fbcu,0x0677fcu,0x0670bcu,0x0669fcu,0x0663bcu,0x065dfcu,0x0658bcu,0x0653fcu,
+ 0x064fbcu,0x064bfcu,0x0648bcu,0x0645fcu,0x0643bcu,0x0641fcu,0x0640bcu,0x063ffcu,
+};
+static const uint32_t trx_cy_control_word_2[128]={
+ 0x0267bcu,0x028f2cu,0x02bdfcu,0x02e45cu,0x0311fcu,0x03374cu,0x0363bcu,0x038f8cu,
+ 0x03b33cu,0x03dddcu,0x04007cu,0x0429ecu,0x044b7cu,0x0473bcu,0x049b5cu,0x04bb4cu,
+ 0x04e1bcu,0x05009cu,0x0525dcu,0x0543acu,0x0567bcu,0x058b2cu,0x05a75cu,0x05c99cu,
+ 0x05e4bcu,0x0605ccu,0x061fdcu,0x063fbcu,0x065efcu,0x06776cu,0x06957cu,0x06acdcu,
+ 0x06c9bcu,0x06e00cu,0x06fbbcu,0x0716ccu,0x072b7cu,0x07455cu,0x0758fcu,0x0771acu,
+ 0x07843cu,0x079bbcu,0x07b29cu,0x07c38cu,0x07d93cu,0x07e91cu,0x07fd9cu,0x080c6cu,
+ 0x081fbcu,0x08326cu,0x083f9cu,0x08511cu,0x085d3cu,0x086d8cu,0x08789cu,0x0887bcu,
+ 0x08963cu,0x089facu,0x08acfcu,0x08b55cu,0x08c17cu,0x08c8ccu,0x08d3bcu,0x08de0cu,
+ 0x08e3bcu,0x08ecdcu,0x08f17cu,0x08f96cu,0x08fcfcu,0x0903bcu,0x0909dcu,0x090bccu,
+ 0x0910bcu,0x09119cu,0x09155cu,0x09152cu,0x0917bcu,0x0919acu,0x0917dcu,0x09189cu,
+ 0x0915bcu,0x09154cu,0x09115cu,0x090fbcu,0x090d7cu,0x08e7acu,0x08cffcu,0x08b8acu,
+ 0x08a1bcu,0x088b2cu,0x0874fcu,0x085f2cu,0x0849bcu,0x0834acu,0x081ffcu,0x080bacu,
+ 0x07f7bcu,0x07e42cu,0x07d0fcu,0x07be2cu,0x07abbcu,0x0799acu,0x0787fcu,0x0776acu,
+ 0x0765bcu,0x0753bcu,0x07439cu,0x0733dcu,0x07247cu,0x07157cu,0x0706dcu,0x06f89cu,
+ 0x06eabcu,0x06dd3cu,0x06d01cu,0x06c35cu,0x06b6fcu,0x06aafcu,0x069f5cu,0x06941cu,
+ 0x06893cu,0x067ebcu,0x06749cu,0x066adcu,0x06617cu,0x06587cu,0x064fbcu,0x06478cu,
+};
+static const uint32_t trx_cy_control_word_3[128]={
+ 0xff87bcu,0xffb4ecu,0xffe97cu,0x00159cu,0x0048fcu,0x00740cu,0x00a63cu,0x00d7ccu,
+ 0x01013cu,0x01319cu,0x0159fcu,0x01892cu,0x01b07cu,0x01de7cu,0x020bdcu,0x02318cu,
+ 0x025dbcu,0x02825cu,0x02ad5cu,0x02d0ecu,0x02fabcu,0x0323ecu,0x0345dcu,0x036ddcu,
+ 0x038ebcu,0x03b58cu,0x03d55cu,0x03fafcu,0x041ffcu,0x043e2cu,0x0461fcu,0x047f1cu,
+ 0x04a1bcu,0x04bdccu,0x04df3cu,0x05000cu,0x051a7cu,0x053a1cu,0x05537cu,0x0571ecu,
+ 0x058a3cu,0x05a77cu,0x05c41cu,0x05daccu,0x05f63cu,0x060bdcu,0x06261cu,0x063aacu,
+ 0x0653bcu,0x066c2cu,0x067f1cu,0x06965cu,0x06a83cu,0x06be4cu,0x06cf1cu,0x06e3fcu,
+ 0x06f83cu,0x07076cu,0x071a7cu,0x07289cu,0x073a7cu,0x07478cu,0x07583cu,0x07684cu,
+ 0x0773bcu,0x07829cu,0x078cfcu,0x079aacu,0x07a3fcu,0x07b07cu,0x07bc5cu,0x07c40cu,
+ 0x07cebcu,0x07d55cu,0x07dedcu,0x07e46cu,0x07ecbcu,0x07f46cu,0x07f85cu,0x07fedcu,
+ 0x0801bcu,0x08070cu,0x0808dcu,0x080cfcu,0x08107cu,0x0810acu,0x0812fcu,0x08121cu,
+ 0x08133cu,0x08114cu,0x08113cu,0x08108cu,0x080cfcu,0x080b1cu,0x08067cu,0x08036cu,
+ 0x07fdbcu,0x07f97cu,0x07f49cu,0x07ed4cu,0x07e73cu,0x07dedcu,0x07d79cu,0x07ce2cu,
+ 0x07c5bcu,0x07b12cu,0x079fbcu,0x078d1cu,0x077abcu,0x07689cu,0x0757dcu,0x07462cu,
+ 0x0734bcu,0x07238cu,0x07137cu,0x0702bcu,0x06f23cu,0x06e1fcu,0x06d29cu,0x06c2ccu,
+ 0x06b33cu,0x06a3ecu,0x06953cu,0x06865cu,0x0677bcu,0x06695cu,0x065b5cu,0x064d6cu,
+};
+static const uint32_t trx_cy_control_word_4[128]={
+ 0xfe3fbcu,0xfe6f7cu,0xfe9ebcu,0xfecd7cu,0xfefbbcu,0xff297cu,0xff56bcu,0xff837cu,
+ 0xffafbcu,0xffdb7cu,0x0006bcu,0x00317cu,0x005bbcu,0x00857cu,0x00aebcu,0x00d77cu,
+ 0x00ffbcu,0x01277cu,0x014ebcu,0x01757cu,0x019bbcu,0x01c17cu,0x01e6bcu,0x020b7cu,
+ 0x022fbcu,0x02537cu,0x0276bcu,0x02997cu,0x02bbbcu,0x02dd7cu,0x02febcu,0x031f7cu,
+ 0x033fbcu,0x035f7cu,0x037ebcu,0x039d7cu,0x03bbbcu,0x03d97cu,0x03f6bcu,0x04137cu,
+ 0x042fbcu,0x044b7cu,0x0466bcu,0x04817cu,0x049bbcu,0x04b57cu,0x04cebcu,0x04e77cu,
+ 0x04ffbcu,0x05177cu,0x052ebcu,0x05457cu,0x055bbcu,0x05717cu,0x0586bcu,0x059b7cu,
+ 0x05afbcu,0x05c37cu,0x05d6bcu,0x05e97cu,0x05fbbcu,0x060d7cu,0x061ebcu,0x062f7cu,
+ 0x063fbcu,0x064f7cu,0x065ebcu,0x066d7cu,0x067bbcu,0x06897cu,0x0696bcu,0x06a37cu,
+ 0x06afbcu,0x06bb7cu,0x06c6bcu,0x06d17cu,0x06dbbcu,0x06e57cu,0x06eebcu,0x06f77cu,
+ 0x06ffbcu,0x07077cu,0x070ebcu,0x07157cu,0x071bbcu,0x07217cu,0x0726bcu,0x072b7cu,
+ 0x072fbcu,0x07337cu,0x0736bcu,0x07397cu,0x073bbcu,0x073d7cu,0x073ebcu,0x073f7cu,
+ 0x073fbcu,0x073f7cu,0x073ebcu,0x073d7cu,0x073bbcu,0x07397cu,0x0736bcu,0x07337cu,
+ 0x072fbcu,0x072b7cu,0x0726bcu,0x07217cu,0x071bbcu,0x07157cu,0x070ebcu,0x07077cu,
+ 0x06ffbcu,0x06f77cu,0x06eebcu,0x06e57cu,0x06dbbcu,0x06d17cu,0x06c6bcu,0x06bb7cu,
+ 0x06afbcu,0x06a37cu,0x0696bcu,0x06897cu,0x067bbcu,0x066d7cu,0x065ebcu,0x064f7cu,
+};
+static const uint32_t trx_cy_control_word_5[128]={
+ 0xff0fbcu,0xff162cu,0xff1cbcu,0xff1b9cu,0xff227cu,0xff21ccu,0xff28fcu,0xff28bcu,
+ 0xff303cu,0xff306cu,0xff383cu,0xff38dcu,0xff40fcu,0xff420cu,0xff4a7cu,0xff4bfcu,
+ 0xff54bcu,0xff56acu,0xff6d7cu,0xff989cu,0xffc9fcu,0xfff40cu,0x00243cu,0x004d3cu,
+ 0x0075bcu,0x00a42cu,0x00cb9cu,0x00f8dcu,0x011f3cu,0x014b4cu,0x01709cu,0x01956cu,
+ 0x01bfbcu,0x01e37cu,0x020c9cu,0x022f4cu,0x02517cu,0x0278dcu,0x0299fcu,0x02c02cu,
+ 0x02e03cu,0x02ffccu,0x03243cu,0x0342bcu,0x0365fcu,0x03836cu,0x03a57cu,0x03c1dcu,
+ 0x03ddbcu,0x03fe0cu,0x0418dcu,0x0437fcu,0x0451bcu,0x046afcu,0x04885cu,0x04a08cu,
+ 0x04bcbcu,0x04d3dcu,0x04eedcu,0x0504ecu,0x051a7cu,0x0533bcu,0x05483cu,0x05604cu,
+ 0x0573bcu,0x0586acu,0x059cfcu,0x05aedcu,0x05c3fcu,0x05d4ccu,0x05e51cu,0x05f87cu,
+ 0x0607bcu,0x0619ecu,0x06281cu,0x06391cu,0x06463cu,0x0652dcu,0x06621cu,0x066dacu,
+ 0x067bbcu,0x06863cu,0x06903cu,0x069c8cu,0x06a57cu,0x06b09cu,0x06b87cu,0x06c26cu,
+ 0x06c93cu,0x06cf8cu,0x06d7bcu,0x06dcfcu,0x06e3fcu,0x06e82cu,0x06ebdcu,0x06f11cu,
+ 0x06f3bcu,0x06f7ccu,0x06f95cu,0x06fa6cu,0x06fcbcu,0x06fcbcu,0x06fddcu,0x06fcccu,
+ 0x06fcbcu,0x06fa9cu,0x06f7fcu,0x06f62cu,0x06f27cu,0x06ef7cu,0x06eabcu,0x06e57cu,
+ 0x06e0bcu,0x06da6cu,0x06d47cu,0x06cd1cu,0x06c5fcu,0x06bd8cu,0x06b49cu,0x06abbcu,
+ 0x06a1bcu,0x0697acu,0x068c9cu,0x06810cu,0x06753cu,0x06689cu,0x065b9cu,0x064decu,
+};
+static const uint32_t trx_cy_control_word_6[128]={
+ 0x016fbcu,0x01697cu,0x015b9cu,0x014e1cu,0x0148bcu,0x013becu,0x012f7cu,0x01236cu,
+ 0x011f3cu,0x0113dcu,0x0108dcu,0x01058cu,0x00fb3cu,0x00f14cu,0x00e7bcu,0x00e59cu,
+ 0x00dcbcu,0x00d43cu,0x00cc1cu,0x00cb2cu,0x00c3bcu,0x00bcacu,0x00bc9cu,0x00b63cu,
+ 0x00b03cu,0x00aa9cu,0x00abbcu,0x00a6ccu,0x00a23cu,0x00a43cu,0x00a05cu,0x009cdcu,
+ 0x0099bcu,0x009cecu,0x009a7cu,0x00986cu,0x0096bcu,0x009b1cu,0x00a55cu,0x00d11cu,
+ 0x00f6bcu,0x01214cu,0x014b3cu,0x016f3cu,0x0197fcu,0x01baecu,0x01e27cu,0x02045cu,
+ 0x022abcu,0x02507cu,0x0270bcu,0x02954cu,0x02b47cu,0x02d7dcu,0x02f5fcu,0x03182cu,
+ 0x0339bcu,0x03563cu,0x03769cu,0x03920cu,0x03b13cu,0x03cb9cu,0x03e99cu,0x0406fcu,
+ 0x041fbcu,0x043becu,0x04539cu,0x046e9cu,0x04853cu,0x049f0cu,0x04b83cu,0x04cd3cu,
+ 0x04e53cu,0x04f92cu,0x050ffcu,0x0522dcu,0x05387cu,0x054d7cu,0x055ebcu,0x05728cu,
+ 0x0582bcu,0x05955cu,0x05a47cu,0x05b5ecu,0x05c6bcu,0x05d43cu,0x05e3dcu,0x05f04cu,
+ 0x05febcu,0x060a1cu,0x06175cu,0x0623fcu,0x062dbcu,0x06392cu,0x0641dcu,0x064c1cu,
+ 0x0653bcu,0x065cccu,0x06653cu,0x066b3cu,0x06727cu,0x06776cu,0x067d7cu,0x06815cu,
+ 0x06863cu,0x068a7cu,0x068cbcu,0x068fccu,0x0690fcu,0x0692dcu,0x0692fcu,0x0693acu,
+ 0x0693bcu,0x06923cu,0x06911cu,0x068e8cu,0x068c3cu,0x06889cu,0x06851cu,0x0680fcu,
+ 0x067bbcu,0x06766cu,0x06701cu,0x06699cu,0x06623cu,0x065a8cu,0x06523cu,0x06493cu,
+};
+static const uint32_t trx_cy_control_word_7[128]={
+ 0x000600u,0x000602u,0x000604u,0x000606u,0x000608u,0x00060au,0x00060cu,0x00060eu,
+ 0x000610u,0x000612u,0x000614u,0x000616u,0x000618u,0x00061au,0x00061cu,0x00061eu,
+ 0x000620u,0x000622u,0x000624u,0x000626u,0x000628u,0x00062au,0x00062cu,0x00062eu,
+ 0x000630u,0x000632u,0x000634u,0x000636u,0x000638u,0x00063au,0x00063cu,0x00063eu,
+ 0x000640u,0x000642u,0x000644u,0x000646u,0x000648u,0x00064au,0x00064cu,0x00064eu,
+ 0x000650u,0x000652u,0x000654u,0x000656u,0x000658u,0x00065au,0x00065cu,0x00065eu,
+ 0x000660u,0x000662u,0x000664u,0x000666u,0x000668u,0x00066au,0x00066cu,0x00066eu,
+ 0x000670u,0x000672u,0x000674u,0x000676u,0x000678u,0x00067au,0x00067cu,0x00067eu,
+ 0x000680u,0x000682u,0x000684u,0x000686u,0x000688u,0x00068au,0x00068cu,0x00068eu,
+ 0x000690u,0x000692u,0x000694u,0x000696u,0x000698u,0x00069au,0x00069cu,0x00069eu,
+ 0x0006a0u,0x0006a2u,0x0006a4u,0x0006a6u,0x0006a8u,0x0006aau,0x0006acu,0x0006aeu,
+ 0x0006b0u,0x0006b2u,0x0006b4u,0x0006b6u,0x0006b8u,0x0006bau,0x0006bcu,0x0006beu,
+ 0x0006c0u,0x0006c2u,0x0006c4u,0x0006c6u,0x0006c8u,0x0006cau,0x0006ccu,0x0006ceu,
+ 0x0006d0u,0x0006d2u,0x0006d4u,0x0006d6u,0x0006d8u,0x0006dau,0x0006dcu,0x0006deu,
+ 0x0006e0u,0x0006e2u,0x0006e4u,0x0006e6u,0x0006e8u,0x0006eau,0x0006ecu,0x0006eeu,
+ 0x0006f0u,0x0006f2u,0x0006f4u,0x0006f6u,0x0006f8u,0x0006fau,0x0006fcu,0x0006feu,
+};
+static const uint32_t trx_cy_control_word_8[128]={
+ 0x000400u,0x000402u,0x000404u,0x000406u,0x000408u,0x00040au,0x00040cu,0x00040eu,
+ 0x000410u,0x000412u,0x000414u,0x000416u,0x000418u,0x00041au,0x00041cu,0x00041eu,
+ 0x000420u,0x000422u,0x000424u,0x000426u,0x000428u,0x00042au,0x00042cu,0x00042eu,
+ 0x000430u,0x000432u,0x000434u,0x000436u,0x000438u,0x00043au,0x00043cu,0x00043eu,
+ 0x000440u,0x000442u,0x000444u,0x000446u,0x000448u,0x00044au,0x00044cu,0x00044eu,
+ 0x000450u,0x000452u,0x000454u,0x000456u,0x000458u,0x00045au,0x00045cu,0x00045eu,
+ 0x000460u,0x000462u,0x000464u,0x000466u,0x000468u,0x00046au,0x00046cu,0x00046eu,
+ 0x000470u,0x000472u,0x000474u,0x000476u,0x000478u,0x00047au,0x00047cu,0x00047eu,
+ 0x000480u,0x000482u,0x000484u,0x000486u,0x000488u,0x00048au,0x00048cu,0x00048eu,
+ 0x000490u,0x000492u,0x000494u,0x000496u,0x000498u,0x00049au,0x00049cu,0x00049eu,
+ 0x0004a0u,0x0004a2u,0x0004a4u,0x0004a6u,0x0004a8u,0x0004aau,0x0004acu,0x0004aeu,
+ 0x0004b0u,0x0004b2u,0x0004b4u,0x0004b6u,0x0004b8u,0x0004bau,0x0004bcu,0x0004beu,
+ 0x0004c0u,0x0004c2u,0x0004c4u,0x0004c6u,0x0004c8u,0x0004cau,0x0004ccu,0x0004ceu,
+ 0x0004d0u,0x0004d2u,0x0004d4u,0x0004d6u,0x0004d8u,0x0004dau,0x0004dcu,0x0004deu,
+ 0x0004e0u,0x0004e2u,0x0004e4u,0x0004e6u,0x0004e8u,0x0004eau,0x0004ecu,0x0004eeu,
+ 0x0004f0u,0x0004f2u,0x0004f4u,0x0004f6u,0x0004f8u,0x0004fau,0x0004fcu,0x0004feu,
+};
+static const uint32_t trx_cy_control_word_9[128]={
+ 0x000600u,0x000602u,0x000604u,0x000606u,0x000608u,0x00060au,0x00060cu,0x00060eu,
+ 0x000610u,0x000612u,0x000614u,0x000616u,0x000618u,0x00061au,0x00061cu,0x00061eu,
+ 0x000620u,0x000622u,0x000624u,0x000626u,0x000628u,0x00062au,0x00062cu,0x00062eu,
+ 0x000630u,0x000632u,0x000634u,0x000636u,0x000638u,0x00063au,0x00063cu,0x00063eu,
+ 0x000640u,0x000642u,0x000644u,0x000646u,0x000648u,0x00064au,0x00064cu,0x00064eu,
+ 0x000650u,0x000652u,0x000654u,0x000656u,0x000658u,0x00065au,0x00065cu,0x00065eu,
+ 0x000660u,0x000662u,0x000664u,0x000666u,0x000668u,0x00066au,0x00066cu,0x00066eu,
+ 0x000670u,0x000672u,0x000674u,0x000676u,0x000678u,0x00067au,0x00067cu,0x00067eu,
+ 0x000680u,0x000682u,0x000684u,0x000686u,0x000688u,0x00068au,0x00068cu,0x00068eu,
+ 0x000690u,0x000692u,0x000694u,0x000696u,0x000698u,0x00069au,0x00069cu,0x00069eu,
+ 0x0006a0u,0x0006a2u,0x0006a4u,0x0006a6u,0x0006a8u,0x0006aau,0x0006acu,0x0006aeu,
+ 0x0006b0u,0x0006b2u,0x0006b4u,0x0006b6u,0x0006b8u,0x0006bau,0x0006bcu,0x0006beu,
+ 0x0006c0u,0x0006c2u,0x0006c4u,0x0006c6u,0x0006c8u,0x0006cau,0x0006ccu,0x0006ceu,
+ 0x0006d0u,0x0006d2u,0x0006d4u,0x0006d6u,0x0006d8u,0x0006dau,0x0006dcu,0x0006deu,
+ 0x0006e0u,0x0006e2u,0x0006e4u,0x0006e6u,0x0006e8u,0x0006eau,0x0006ecu,0x0006eeu,
+ 0x0006f0u,0x0006f2u,0x0006f4u,0x0006f6u,0x0006f8u,0x0006fau,0x0006fcu,0x0006feu,
+};
+static const uint32_t trx_cy_control_word_10[128]={
+ 0x200000u,0x20c000u,0x218000u,0x224000u,0x230000u,0x23c000u,0x248000u,0x254000u,
+ 0x260000u,0x26c000u,0x278000u,0x284000u,0x290000u,0x29c000u,0x2a8000u,0x2b4000u,
+ 0x2c0000u,0x2cc000u,0x2d8000u,0x2e4000u,0x2f0000u,0x2fc000u,0x308000u,0x314000u,
+ 0x320000u,0x32c000u,0x338000u,0x344000u,0x350000u,0x35c000u,0x368000u,0x374000u,
+ 0x380000u,0x38c000u,0x398000u,0x3a4000u,0x3b0000u,0x3bc000u,0x3c8000u,0x3d4000u,
+ 0x3e0000u,0x3ec000u,0x3f8000u,0x404000u,0x410000u,0x41c000u,0x428000u,0x434000u,
+ 0x440000u,0x44c000u,0x458000u,0x464000u,0x470000u,0x47c000u,0x488000u,0x494000u,
+ 0x4a0000u,0x4ac000u,0x4b8000u,0x4c4000u,0x4d0000u,0x4dc000u,0x4e8000u,0x4f4000u,
+ 0x500000u,0x50c000u,0x518000u,0x524000u,0x530000u,0x53c000u,0x548000u,0x554000u,
+ 0x560000u,0x56c000u,0x578000u,0x584000u,0x590000u,0x59c000u,0x5a8000u,0x5b4000u,
+ 0x5c0000u,0x5cc000u,0x5d8000u,0x5e4000u,0x5f0000u,0x5fc000u,0x608000u,0x614000u,
+ 0x620000u,0x62c000u,0x638000u,0x644000u,0x650000u,0x65c000u,0x668000u,0x674000u,
+ 0x680000u,0x68c000u,0x698000u,0x6a4000u,0x6b0000u,0x6bc000u,0x6c8000u,0x6d4000u,
+ 0x6e0000u,0x6ec000u,0x6f8000u,0x704000u,0x710000u,0x71c000u,0x728000u,0x734000u,
+ 0x740000u,0x74c000u,0x758000u,0x764000u,0x770000u,0x77c000u,0x788000u,0x794000u,
+ 0x7a0000u,0x7ac000u,0x7b8000u,0x7c4000u,0x7d0000u,0x7dc000u,0x7e8000u,0x7f4000u,
+};
+static const uint32_t trx_cy_control_word_11[128]={
+ 0x000020u,0x000020u,0x000020u,0x000021u,0x000021u,0x000021u,0x000022u,0x000022u,
+ 0x000022u,0x000023u,0x000023u,0x000023u,0x000024u,0x000024u,0x000024u,0x000025u,
+ 0x000025u,0x000025u,0x000026u,0x000026u,0x000026u,0x000027u,0x000027u,0x000027u,
+ 0x000028u,0x000028u,0x000028u,0x000029u,0x000029u,0x000029u,0x00002au,0x00002au,
+ 0x00002au,0x00002bu,0x00002bu,0x00002bu,0x00002cu,0x00002cu,0x00002cu,0x00002du,
+ 0x00002du,0x00002du,0x00002eu,0x00002eu,0x00002eu,0x00002fu,0x00002fu,0x00002fu,
+ 0x000030u,0x000030u,0x000030u,0x000031u,0x000031u,0x000031u,0x000032u,0x000032u,
+ 0x000032u,0x000033u,0x000033u,0x000033u,0x000034u,0x000034u,0x000034u,0x000035u,
+ 0x000035u,0x000035u,0x000036u,0x000036u,0x000036u,0x000037u,0x000037u,0x000037u,
+ 0x000038u,0x000038u,0x000038u,0x000039u,0x000039u,0x000039u,0x00003au,0x00003au,
+ 0x00003au,0x00003bu,0x00003bu,0x00003bu,0x00003cu,0x00003cu,0x00003cu,0x00003du,
+ 0x00003du,0x00003du,0x00003eu,0x00003eu,0x00003eu,0x00003fu,0x00003fu,0x00003fu,
+ 0x000040u,0x000040u,0x000040u,0x000041u,0x000041u,0x000041u,0x000042u,0x000042u,
+ 0x000042u,0x000043u,0x000043u,0x000043u,0x000044u,0x000044u,0x000044u,0x000045u,
+ 0x000045u,0x000045u,0x000046u,0x000046u,0x000046u,0x000047u,0x000047u,0x000047u,
+ 0x000048u,0x000048u,0x000048u,0x000049u,0x000049u,0x000049u,0x00004au,0x00004au,
+};
+static const uint32_t trx_cy_control_word_12[128]={
+ 0x7f263bu,0x7f273bu,0x7f283bu,0x7f293bu,0x7f2a3bu,0x7f2b3bu,0x7f2c3bu,0x7f2d3bu,
+ 0x7f2e3bu,0x7f2f3bu,0x7f303bu,0x7f313bu,0x7f323bu,0x7f333bu,0x7f343bu,0x7f353bu,
+ 0x7f363bu,0x7f373bu,0x7f383bu,0x7f393bu,0x7f3a3bu,0x7f3b3bu,0x7f3c3bu,0x7f3d3bu,
+ 0x7f3e3bu,0x7f3f3bu,0x7f403bu,0x7f413bu,0x7f423bu,0x7f433bu,0x7f443bu,0x7f453bu,
+ 0x7f463bu,0x7f473bu,0x7f483bu,0x7f493bu,0x7f4a3bu,0x7f4b3bu,0x7f4c3bu,0x7f4d3bu,
+ 0x7f4e3bu,0x7f4f3bu,0x7f503bu,0x7f513bu,0x7f523bu,0x7f533bu,0x7f543bu,0x7f553bu,
+ 0x7f563bu,0x7f573bu,0x7f583bu,0x7f593bu,0x7f5a3bu,0x7f5b3bu,0x7f5c3bu,0x7f5d3bu,
+ 0x7f5e3bu,0x7f5f3bu,0x7f603bu,0x7f613bu,0x7f623bu,0x7f633bu,0x7f643bu,0x7f653bu,
+ 0x7f663bu,0x7f673bu,0x7f683bu,0x7f693bu,0x7f6a3bu,0x7f6b3bu,0x7f6c3bu,0x7f6d3bu,
+ 0x7f6e3bu,0x7f6f3bu,0x7f703bu,0x7f713bu,0x7f723bu,0x7f733bu,0x7f743bu,0x7f753bu,
+ 0x7f763bu,0x7f773bu,0x7f783bu,0x7f793bu,0x7f7a3bu,0x7f7b3bu,0x7f7c3bu,0x7f7d3bu,
+ 0x7f7e3bu,0x7f7f3bu,0x7f803bu,0x7f813bu,0x7f823bu,0x7f833bu,0x7f843bu,0x7f853bu,
+ 0x7f863bu,0x7f873bu,0x7f883bu,0x7f893bu,0x7f8a3bu,0x7f8b3bu,0x7f8c3bu,0x7f8d3bu,
+ 0x7f8e3bu,0x7f8f3bu,0x7f903bu,0x7f913bu,0x7f923bu,0x7f933bu,0x7f943bu,0x7f953bu,
+ 0x7f963bu,0x7f973bu,0x7f983bu,0x7f993bu,0x7f9a3bu,0x7f9b3bu,0x7f9c3bu,0x7f9d3bu,
+ 0x7f9e3bu,0x7f9f3bu,0x7fa03bu,0x7fa13bu,0x7fa23bu,0x7fa33bu,0x7fa43bu,0x7fa53bu,
+};
+static void trx_cy_trx_cy_from_knobs(const float k[8],uint32_t p[13]){p[0]=trx_cy_control_word_0[(unsigned)k[1]];p[1]=trx_cy_control_word_1[(unsigned)k[0]];p[2]=trx_cy_control_word_2[(unsigned)k[0]];p[3]=trx_cy_control_word_3[(unsigned)k[0]];p[4]=trx_cy_control_word_4[(unsigned)k[0]];p[5]=trx_cy_control_word_5[(unsigned)k[0]];p[6]=trx_cy_control_word_6[(unsigned)k[0]];p[7]=trx_cy_control_word_7[(unsigned)k[3]];p[8]=trx_cy_control_word_8[(unsigned)k[4]];p[9]=trx_cy_control_word_9[(unsigned)k[4]];p[10]=trx_cy_control_word_10[(unsigned)k[2]];p[11]=trx_cy_control_word_11[(unsigned)k[5]];p[12]=trx_cy_control_word_12[(unsigned)k[1]];}
+static void trx_cy_cy_convert(const uint32_t raw[8],uint32_t *p){float k[8];for(unsigned i=0;i<8;++i)k[i]=(float)(raw[i]>>7);trx_cy_trx_cy_from_knobs(k,p);}
+
+
+
+#ifndef TRX_COMPACT_MODEL_MATH
+#define TRX_COMPACT_MODEL_MATH
+static inline double trx_cy_trx_model_exp(double x) {
+    const double ln2=0.69314718055994530942;
+    int n=(int)(x/ln2+(x<0?-0.5:0.5));
+    double r=x-n*ln2,term=1,sum=1;
+    for(unsigned k=1;k<=18;++k) { term*=r/k;sum+=term; }
+    while(n>0) {sum*=2;--n;}
+    while(n<0) {sum*=0.5;++n;}
+    return sum;
+}
+static inline double trx_cy_trx_model_cos(double x) {
+    double term=1,sum=1;
+    for(unsigned k=1;k<=18;++k) {term*=-x*x/((2*k-1)*(2*k));sum+=term;}
+    return sum;
+}
+static inline long long trx_model_round(double x) {return (long long)(x+(x<0?-0.5:0.5));}
+static inline uint32_t trx_cy_trx_model_word(double v) {
+    if (v > 8388607.0) v = 8388607.0;
+    if (v < -8388608.0) v = -8388608.0;
+    return (uint32_t)(int32_t)trx_model_round(v) & 0xffffffu;
+}
+static inline double trx_cy_trx_model_cheb(const double *c,unsigned n,double x) {
+    double b1=0,b2=0;
+    for(unsigned k=n;k>1;--k) { double b=2*x*b1-b2+c[k-1]; b2=b1;b1=b; }
+    return x*b1-b2+c[0];
+}
+#endif
+static const double trx_cy_trx_model_offset_a_c[30]={-232.399680398,153.649305252,-56.7606534091,23.5448649658,-10.6578480114,4.79767127404,-81.056751598,22.7077837039,-2.96244673295,0.299532376803,0.0532892400568,-0.0105212089343,-39.1668372957,14.9894597998,-2.21767366486,0.405478971463,-0.0117738691504,0.138342962517,-15.9882689259,7.39288842873,-1.35951208431,0.190096146761,0.00637058241878,-0.116429618127,-5.5138140884,3.0706297243,-0.547032748071,0.15553066531,0.0144368154093,-0.0443455945788};
+static const double trx_cy_trx_model_offset_b_c[13]={-357.643862343,-265.373321533,59.3405978631,-17.7956076723,5.97881763422,-2.11982610249,0.784178870543,-0.267558388544,0.0889657720231,0.0650633677486,0.00493977326511,-0.0123225741715,-0.021290158449};
+static inline int trx_model_offset(unsigned i) {
+    if(i>=128) return (int)trx_model_round(trx_cy_trx_model_cheb(trx_cy_trx_model_offset_b_c,13,2.0*(i-128)/127.0-1.0));
+    unsigned part=i<8?0:i<16?1:i<32?2:i<64?3:4;
+    static const unsigned trx_cy_bounds[]={0,8,16,32,64,128};
+    unsigned lo=trx_cy_bounds[part],hi=trx_cy_bounds[part+1];
+    return (int)trx_model_round(trx_cy_trx_model_cheb(trx_cy_trx_model_offset_a_c+part*6,6,2.0*(i-lo)/(hi-lo-1)-1.0));
+}
+static inline uint32_t trx_cy_trx_model_memory(unsigned i) {
+    if(i<256) return (uint32_t)trx_model_offset(i)&0xffffffu;
+    unsigned x=i<4352?i-256:i-4352;
+    double t=trx_cy_trx_model_exp(0.003372927270490704*x+(-12.768360569597025));
+    return trx_cy_trx_model_word(5931641.6632877039*(i<4352?trx_cy_trx_model_cos(t):trx_cy_trx_model_exp(-t)));
+}
+
+
+
+static uint32_t trx_cy_metal_norm(unsigned i){return trx_cy_trx_model_memory(i);}
+static uint32_t trx_cy_metal_filter(unsigned i){return trx_cy_trx_model_memory(i);}
+static uint32_t trx_cy_metal_offsets(unsigned i){return (uint32_t)trx_model_offset(i)&0xffffffu;}
+static uint32_t trx_cy_metal_square(unsigned source,unsigned index){
+ static const unsigned trx_cy_transition[6]={72,51,43,40,29,26};
+ return index<trx_cy_transition[source]?8387769u:((uint32_t)-8387769)&0xffffffu;
+}
+
+
+
+
+
+
+static inline void trx_cy_metal_source(uint32_t *w,unsigned start,uint32_t cursors[6],const uint32_t gains[6],int add)
+{
+
+ static const unsigned trx_cy_periods[6]={114,102,86,80,58,52};
+ for(unsigned source=0;source<6;++source){
+  for(unsigned i=0;i<32;++i){
+   uint64_t product=trx_cy_md_mpy(trx_cy_metal_square(source,cursors[source]),gains[source]);
+   if(source||add)product=trx_cy_md_add(product,trx_cy_md_from24(w[start+i]));
+   w[start+i]=trx_cy_md_acc_to_word(product);
+   if(++cursors[source]==trx_cy_periods[source])cursors[source]=0;
+  }
+ }
+}
+static inline void trx_cy_metal_coeff(unsigned index,unsigned resonance,uint32_t *feedback,uint32_t *square,uint32_t *feed)
+{
+ uint32_t pole=trx_cy_metal_filter(0x1900+index+trx_cy_md_s24(trx_cy_metal_offsets(128+resonance)));
+ uint64_t product=trx_cy_md_mpy(pole,trx_cy_metal_norm(0x900+index+trx_cy_md_s24(trx_cy_metal_offsets(resonance))));
+ *square=trx_cy_md_acc_to_word(trx_cy_md_sub(0,trx_cy_md_mpy(pole,pole)));
+ *feedback=trx_cy_md_acc_to_word(trx_cy_md_asl(product,1));
+ *feed=trx_cy_md_acc_to_word(trx_cy_md_sub(trx_cy_md_from24(0x400000),trx_cy_md_add(trx_cy_md_asl(product,1),trx_cy_md_from24(*square))));
+}
+
+static inline void trx_cy_metal_resonant_lowpass(uint32_t *w,unsigned input_base,unsigned output_base,uint32_t history[4],unsigned index,unsigned resonance)
+{
+ uint32_t feedback,square,feed;trx_cy_metal_coeff(index,resonance,&feedback,&square,&feed);
+ w[0]=history[0];w[1]=history[1];
+ w[input_base-2]=history[2];w[input_base-1]=history[3];
+ unsigned history_pos=0,input=input_base+1,delay=input_base-2,adjacent=input_base-1;
+ uint64_t first=trx_cy_md_mac(trx_cy_md_mpy(square,w[0]),feedback,w[1]);
+ first=trx_cy_md_mac(first,w[input_base],feed);
+ for(unsigned i=0;i<32;++i){
+  first=trx_cy_md_asl(first,1);
+  uint64_t second=trx_cy_md_mpy(square,w[delay++]);
+  second=trx_cy_md_mac(second,feedback,w[adjacent++]);
+  uint32_t first_word=trx_cy_md_acc_to_word(first);
+  second=trx_cy_md_mac(second,first_word,feed);
+  w[history_pos]=first_word;history_pos^=1;
+  second=trx_cy_md_asl(second,1);
+  first=trx_cy_md_mpy(square,w[history_pos]);history_pos^=1;
+  first=trx_cy_md_mac(first,feedback,w[history_pos]);history_pos^=1;
+  first=trx_cy_md_mac(first,w[input--],feed);
+  w[input]=trx_cy_md_acc_to_word(second);input+=2;
+ }
+
+ (void)output_base;
+ history[0]=w[history_pos];history_pos^=1;history[1]=w[history_pos];
+ history[3]=w[adjacent];history[2]=w[adjacent-1];
+}
+
+
+
+static inline void trx_cy_metal_difference_cascade(uint32_t*w,unsigned input_base,unsigned output_base,unsigned history_base,uint32_t history[6],unsigned index,unsigned resonance)
+{
+ uint32_t feedback,square,unused;trx_cy_metal_coeff(index,resonance,&feedback,&square,&unused);
+ w[history_base]=history[1];w[history_base+1]=history[0];
+ w[output_base]=history[3];w[output_base+1]=history[2];
+ w[input_base-2]=history[5];w[input_base-1]=history[4];
+ unsigned memory=0,input=input_base-2,delay=output_base+1;
+ uint64_t first=trx_cy_md_mpy(square,w[history_base+memory]);memory^=1;
+ first=trx_cy_md_mac(first,feedback,w[history_base+memory]);
+ uint32_t sample=w[input++];
+ for(unsigned i=0;i<32;++i){
+  first=trx_cy_md_mac(first,sample,0x400000);sample=w[input++];
+  first=trx_cy_md_mac(first,sample,0x800000);sample=w[input--];
+  first=trx_cy_md_mac(first,sample,0x400000);
+  first=trx_cy_md_asl(first,1);
+  --delay;
+  uint64_t second=trx_cy_md_mpy(square,w[delay++]);
+  second=trx_cy_md_mac(second,feedback,w[delay++]);
+  uint32_t first_word=trx_cy_md_acc_to_word(first);
+  second=trx_cy_md_mac(second,first_word,0x400000);
+  second=trx_cy_md_mac(second,w[history_base+memory],0x800000);memory^=1;
+  second=trx_cy_md_mac(second,w[history_base+memory],0x400000);
+  w[history_base+memory]=first_word;memory^=1;
+  second=trx_cy_md_asl(second,1);
+  first=trx_cy_md_mpy(square,w[history_base+memory]);memory^=1;
+  sample=w[input++];first=trx_cy_md_mac(first,first_word,feedback);
+  w[delay]=trx_cy_md_acc_to_word(second);
+ }
+ history[0]=w[history_base+memory];memory^=1;history[1]=w[history_base+memory];
+ history[2]=w[delay];history[3]=w[delay-1];
+ history[4]=w[input];history[5]=w[input-1];
+}
+
+
+
+
+
+
+static void trx_cy_clear_state(void *memory,unsigned bytes)
+{
+ volatile unsigned char *cursor=memory;
+ while(bytes--)*cursor++=0;
+}
+static void trx_cy_cy_controls(mdkit_trx_cy*s)
+{uint32_t raw[8],p[64];for(unsigned i=0;i<8;++i)raw[i]=(uint32_t)(128*s->clock.current[i]);trx_cy_cy_convert(raw,p);s->decay=p[0];for(unsigned i=0;i<6;++i)s->metal_gains[i]=p[1+i];s->top_index=p[7];s->size_index[0]=p[8];s->size_index[1]=p[9];s->top_gain=p[10];s->peak=p[11];s->body_decay=p[12];}
+
+static void trx_cy_cy_init(void*state)
+{mdkit_trx_cy*s=state;trx_cy_clear_state(s,sizeof*s);trx_cy_md_trx_events_init(&s->clock,&s->events);trx_cy_cy_controls(s);}
+static void trx_cy_cy_set(void*state,unsigned i,unsigned value){trx_cy_md_trx_events_target(&((mdkit_trx_cy*)state)->events,6,i,value);}
+static void trx_cy_cy_trigger(void*state){((mdkit_trx_cy*)state)->events.trigger=1;}
+static void trx_cy_cy_boundary(mdkit_trx_cy*s)
+{unsigned flags=trx_cy_md_trx_events_boundary(&s->clock,&s->events,0);if(flags&trx_cy_MD_TRX_PUBLISH)trx_cy_cy_controls(s);if(flags&trx_cy_MD_TRX_FIRST){trx_cy_clear_state(s->cursors,sizeof s->cursors);trx_cy_clear_state(s->difference_history,sizeof s->difference_history);trx_cy_clear_state(s->resonant_history,sizeof s->resonant_history);}if(flags&trx_cy_MD_TRX_TRIGGER){s->latched_peak=s->peak;}if(flags&trx_cy_MD_TRX_TRIGGER)for(unsigned i=0;i<2;++i)s->amplitude[i]=trx_cy_md_acc_to_word(trx_cy_md_add(trx_cy_md_from24(0x50c335),trx_cy_md_from24(s->amplitude[i])));}
+static void trx_cy_cy_block(mdkit_trx_cy*s)
+{
+ uint32_t*w=s->workspace;trx_cy_metal_source(w,96,s->cursors,s->metal_gains,0);
+ trx_cy_metal_difference_cascade(w,96,4,0,s->difference_history[0],0x680,s->peak);
+ trx_cy_metal_resonant_lowpass(w,4,4,s->resonant_history[0],s->top_index,s->latched_peak);
+ trx_cy_metal_difference_cascade(w,96,38,0,s->difference_history[1],s->size_index[0],s->latched_peak);
+ trx_cy_metal_resonant_lowpass(w,38,38,s->resonant_history[1],s->size_index[1],s->latched_peak);
+ for(unsigned i=0;i<32;++i){w[4+i]=trx_cy_md_acc_to_word(trx_cy_md_mpy(w[4+i],s->amplitude[0]));w[38+i]=trx_cy_md_acc_to_word(trx_cy_md_mpy(w[38+i],s->amplitude[1]));}
+ s->amplitude[0]=trx_cy_md_acc_to_word(trx_cy_md_mpy(s->body_decay,s->amplitude[0]));s->amplitude[1]=trx_cy_md_acc_to_word(trx_cy_md_mpy(s->decay,s->amplitude[1]));
+ for(unsigned i=0;i<32;++i)s->block[i]=trx_cy_md_acc_to_word(trx_cy_md_asr(trx_cy_md_mac(trx_cy_md_mpy(w[4+i],s->top_gain),w[38+i],0x400000),1));
+}
+static void trx_cy_cy_render(void*state,float*out,unsigned frames)
+{mdkit_trx_cy*s=state;while(frames){if(!s->pos){trx_cy_cy_boundary(s);trx_cy_cy_block(s);}unsigned n=32-s->pos;if(n>frames)n=frames;for(unsigned i=0;i<n;++i)out[i]=(float)trx_cy_md_s24(s->block[s->pos+i])/8388608;frames-=n;out+=n;s->pos=(s->pos+n)&31;}}
+static const char*const trx_cy_names[]={"RICH","DEC","TOP","TTUN","SIZE","PEAK"};
+const mdkit_voice mdkit_voice_trx_cy={"TRX-CY",24,6,trx_cy_names,sizeof(mdkit_trx_cy),trx_cy_cy_init,trx_cy_cy_set,trx_cy_cy_trigger,trx_cy_cy_render, mdkit_trx_cy_defaults
+};

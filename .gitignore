@@ -1,0 +1,24 @@
+# Generated builds and player modules
+/out/
+*.wasm
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+
+# Local audio renders
+*.raw
+*.wav
+
+# Local agent/worktree state
+/.kilo/
+/.codex/
+/.worktrees/
+
+# Python caches and OS metadata
+__pycache__/
+*.py[cod]
+.DS_Store

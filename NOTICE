@@ -1,0 +1,10 @@
+mdkit
+Copyright (c) 2026 Soejrd
+
+mdkit is made available under CC0 1.0 Universal. The full legal text is in
+LICENSE. Source files identify the dedication with
+SPDX-License-Identifier: CC0-1.0. CC0 covers the rights the contributors can
+dedicate; it does not grant rights to third-party names or materials.
+
+The web player uses browser APIs and the included C voices. It does not bundle
+external JavaScript libraries, fonts, or an additional synthesis runtime.

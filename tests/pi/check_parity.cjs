@@ -1,0 +1,6 @@
+/* SPDX-License-Identifier: CC0-1.0 */
+'use strict';
+const fs=require('fs');
+(async()=>{const [file,reference,prefix]=process.argv.slice(2);const m=await WebAssembly.compile(fs.readFileSync(file));if(WebAssembly.Module.imports(m).length)throw Error('unexpected WASM imports');const w=(await WebAssembly.instantiate(m,{})).exports;const call=(s,...a)=>w[`${prefix}_${s}`](...a);const sizes=[1,7,31,257,32,63,511];const out=[];call('init');let pos=0;
+while(pos<16384){if(pos===0)call('trigger');if(pos===1024)call('set_control',0,0);if(pos===4096)call('trigger');if(pos===8192)call('set_control',0,127);if(pos===12288)call('trigger');const end=pos<1024?1024:pos<4096?4096:pos<8192?8192:pos<12288?12288:16384;let k=0;while(pos<end){const n=Math.min(sizes[k++%sizes.length],end-pos);const ptr=call('render',n);out.push(...new Float32Array(w.memory.buffer,ptr,n));pos+=n;}}
+const buf=fs.readFileSync(reference);let peak=0,rms=0,count=0;for(let i=0;i<out.length;i++){const d=Math.abs(out[i]-buf.readFloatLE(i*4));peak=Math.max(peak,d);rms+=d*d;if(d>1e-7)count++;if(!Number.isFinite(d))throw Error('nonfinite parity value');}rms=Math.sqrt(rms/out.length);console.log(`native/WASM parity peak=${peak} rms=${rms} differing=${count}/${out.length}`);if(peak>1e-5)process.exitCode=1;})().catch(e=>{console.error(e);process.exit(1)});

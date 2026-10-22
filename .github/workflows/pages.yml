@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: CC0-1.0
+name: Publish showcase player
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Install WASM compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+      - name: Build and check player
+        run: make web check-web WASM_CC=/usr/bin/clang
+      - name: Prepare public files
+        run: |
+          mkdir -p out/pages
+          install -m 644 website/index.html website/style.css website/script.js website/machine-worklet.js website/sample-worker.js website/mdkit.wasm out/pages/
+      - name: Upload player
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: out/pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy player
+        id: deployment
+        uses: actions/deploy-pages@v4
