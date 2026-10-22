@@ -4,8 +4,7 @@ mdkit brings the EFM, TRX and PI families into standalone C99.
 
 [Try them yourself →](https://soejrd.github.io/mdkit/)
 
-Build them into an instrument or port them to your favourite language. Each voice
-keeps its synthesis helpers in its own C file, with no external sound data required.
+Build them into an instrument or port them to your favourite language.
 
 ## Voices
 
