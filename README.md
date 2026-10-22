@@ -1,5 +1,5 @@
 # mdkit
-Portable C drum synthesis voices based on the Elektron Machinedrum.
+Portable C drum synthesis voices based on the Machinedrum.
 
 mdkit is being developed as a collection of individual synthesis voices for
 developers building instruments, audio plugins and embedded audio applications.
@@ -8,7 +8,7 @@ layer and a straightforward C interface.
 
 ---
 
-All machinedrum machines will soon be available on a digitakt too, I'm resynthesizing them all and porting to digitakt. 
+All machinedrum machines will soon be available for the digitakt too, I'm resynthesizing them all and porting to digitakt. 
 
 ---
 
@@ -29,7 +29,6 @@ The planned scope is 30 voices across three families:
 | Language | C99 |
 | Output | Mono float32 audio |
 | Core sample rate | 44,100 Hz |
-| Render length | Any positive number of frames |
 | State | Caller-owned, separate for each instance |
 | Internal arithmetic | Voice-specific; fixed-point behavior retained where required |
 
